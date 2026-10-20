@@ -2,7 +2,8 @@
 
 The provider kit holds the parts every local-engine provider shares: the
 engine process it starts and supervises, the typed refusal of a load, the
-model files it proves where they lie, and the video@1 operation table. A
+model files it proves where they lie, and the operation table of
+`abstraction.inference/video@1`. A
 provider composes them with the resource kit's `holder` and `gpufault`; the
 kit carries no engine of its own and no provider's vocabulary beyond the
 words below.
@@ -11,7 +12,7 @@ Binds: [inference.thrift](https://github.com/openabstractions/abstraction-infere
 
 The conventions every OA contract carries are stated once in [CONVENTIONS.md](https://github.com/openabstractions/abstractions/blob/main/idl/CONVENTIONS.md); a rule here that applies one cites its `CONV-` id.
 
-## KIT-P1 — One owned engine process
+## [KIT-P1] One owned engine process
 
 `engineproc.Start` MUST start an engine only from the environment its caller
 built; an empty environment is refused and nothing is inherited. On Windows
@@ -20,13 +21,13 @@ with the caller's per-process memory limit, and its exit MUST read as ended
 only once every process of the job is confirmed gone. Outside Windows the
 engine is a direct child and a memory limit is refused.
 
-## KIT-P2 — The engine's log
+## [KIT-P2] The engine's log
 
 An engine's output MUST be kept only in a log of the provider's private
 state, bounded per file with one earlier file kept. It carries prompts and
 request bodies and MUST NOT reach a caller.
 
-## KIT-P3 — One exit record per end
+## [KIT-P3] One exit record per end
 
 Every end of an engine MUST produce one exit record naming the engine, the
 model it was started for, its process id and what its supervisor saw: the
@@ -34,7 +35,7 @@ code or signal, the run time, the memory peaks and whether the job's limit
 refused an allocation. The record goes to the provider's exit hook and, when
 the provider owns the stream, as the last line of the engine's log.
 
-## KIT-P4 — The device-lost line
+## [KIT-P4] The device-lost line
 
 A provider that listens for an engine's own device-lost line reads it on the
 engine's output and binds it to the process that printed it. The line counts
@@ -42,7 +43,7 @@ as a lost device only once that engine exits or fails its own readiness
 twice within `DeviceLostConfirm`; it is then reported to the provider's GPU
 fault handling (resource CONTRACT.md RES-G1).
 
-## KIT-P5 — The engine as a holder component
+## [KIT-P5] The engine as a holder component
 
 `engineproc.Owned` is a `holder.Owned`: its readiness is the engine's own
 probe within the provider's budget, then the engine's socket rule (inference
@@ -54,7 +55,7 @@ error a starting engine never gives (enginehttp `ErrEngineUnreachable`, inferenc
 INF-EL2) refuses readiness with `engine:unreachable`, naming the system
 error, instead of waiting out the provider's budget.
 
-## KIT-P6 — A stop targets one process
+## [KIT-P6] A stop targets one process
 
 A stop MUST end only the process tree the provider started and report it
 stopped only once that tree's exit is confirmed.
@@ -68,7 +69,7 @@ included, and needs no administrator. Process creation inside it is the
 facade's (`supervision.Options.Container`, FAC-P3); this package owns what
 the container is given, for every provider whose engine runs contained.
 
-## KIT-S1 — One profile per engine kind
+## [KIT-S1] One profile per engine kind
 
 An engine kind's profile is `oa.engine.<provider>.<kind>`, with `.<label>`
 after it for a second installation of the same kind; each part is lower-case
@@ -80,7 +81,7 @@ which reaches only what an access list names it for. LPAC, which also refuses `s
 not used: an engine whose libraries import asyncio, as PyTorch's do, cannot
 start there.
 
-## KIT-S2 — Grants are applied once, at install or update, and recorded first
+## [KIT-S2] Grants are applied once, at install or update, and recorded first
 
 `Begin` takes the sandbox's lock alone, records the phase `installing` in
 the manifest before anything else, and creates the profile or adopts the one
@@ -100,7 +101,7 @@ update put in a granted folder carry the grant; its snapshot stays the first
 install's, and a grant only widens. `Commit` records the phase `ready`. A
 launch never grants.
 
-## KIT-S3 — A launch checks the sandbox and holds it
+## [KIT-S3] A launch checks the sandbox and holds it
 
 `Prepare` refuses a launch with a reason: `ErrBusy` while Setup holds the
 lock or the phase is not `ready`; `ErrNotInstalled` without a manifest, or
@@ -117,7 +118,7 @@ it. Once installed, the check and the contained start add 14 ms to a launch
 on the owner's machine (`TestContainedLaunchCost`: a 2.4 ms check and a
 12 ms longer start, medians of seven); the target is under a second.
 
-## KIT-S4 — Removal restores every access list and deletes the profile
+## [KIT-S4] Removal restores every access list and deletes the profile
 
 `Remove` first validates the manifest's paths, identity, profile/SID pair and
 saved access lists, then takes the lock alone and revalidates. It records the phase `removing`, revokes every
@@ -131,14 +132,14 @@ A recorded grant path that has disappeared is unresolved: a rename could
 have moved its original ACE outside the recorded tree. Removal retains the
 manifest and profile until that path is restored for checked revocation.
 
-## KIT-S5 — A stopped install is found and removed
+## [KIT-S5] A stopped install is found and removed
 
 An install stopped after any step, as a crash stops it, leaves the phase
 `installing`, which refuses every launch, and a manifest naming every path it
 touched, so `Remove` takes it all back. `Profiles(prefix)` lists the profiles
 the system records for this account, a left one included.
 
-## KIT-S6 — Files outside the grants are lent, never granted by a launch
+## [KIT-S6] Files outside the grants are lent, never granted by a launch
 
 A provider gives a contained engine a file it may not open by path, such as a
 model the person adopted in place, by `engineproc.Process.Lend`: a read-only
@@ -147,7 +148,7 @@ bytes through it and cannot write them. Outside Windows every call of
 `sandbox` is refused (`ErrUnsupported`) and `engineproc.Start` refuses a
 container.
 
-## KIT-S7 — Ancestors get attributes, never contents
+## [KIT-S7] Ancestors get attributes, never contents
 
 A program that resolves its folder by lstat-ing every ancestor from the drive
 root needs `SYNCHRONIZE` and `FILE_READ_ATTRIBUTES` on each ancestor itself,
@@ -194,12 +195,12 @@ ungranted file denied, an OA pipe that admits the container answers, a lent
 handle reads and does not write), `TestContainedLaunchCost`,
 `TestAStopMidLaunchLeavesTheSandboxWhole`.
 
-## KIT-R1 — The typed refusal
+## [KIT-R1] The typed refusal
 
 A refusal carries a word the caller reads and a detail the provider's log
 keeps. Neither carries engine text.
 
-## KIT-R2 — The words of a refused load
+## [KIT-R2] The words of a refused load
 
 A load the lease refused reads the resource kit's lease word
 (`holder.Failure.Word`); a refusal the load made itself reads its own word;
@@ -207,7 +208,7 @@ any other failure reads `unavailable`. A GPU fault refusal keeps the Guard's
 word (`gpu:standby`, `gpu:resetting`, `gpu:quarantined`). A video or image
 whose engine could not load and named no word fails `engine:unavailable`.
 
-## KIT-M1 — Model files proved where they lie
+## [KIT-M1] Model files proved where they lie
 
 `modelplace.Place` MUST find each pinned file through the provider's
 searches, prove it in place by size, SHA-256 and, when pinned, its Git blob
@@ -217,25 +218,25 @@ the provider's `StoreFiles`, the stores' names and a whole stored file's
 path; the kit imports no provider, and a provider that reads stores adapts
 its own source.
 
-## KIT-M2 — The places record
+## [KIT-M2] The places record
 
 A places record names each pinned file once, with its absolute path and the
 owners it may be trusted under: the machine's owners and this account alone.
 A record naming another owner, a file of no pin, or missing one is refused;
 a refusal names the command that writes the record.
 
-## KIT-M3 — OA's model folders
+## [KIT-M3] OA's model folders
 
 `modelplace.AdoptModelFolder` makes a folder directly under OA's models root
 a model folder of this account (identity ID-D3) and leaves every other folder
 as it is.
 
-## KIT-M4 — No copy, no download
+## [KIT-M4] No copy, no download
 
 The kit downloads no model and copies none; a provider's Setup stages files,
 and the kit proves them where they lie.
 
-## KIT-V1 — Admission and the queue
+## [KIT-V1] Admission and the queue
 
 `videoops.Table.Start` admits a video for its caller (inference INF-G5): a
 request_id the caller holds names its operation again; one model; a request
@@ -243,24 +244,24 @@ the kind refuses is refused before it is queued; a quarantined fingerprint
 is refused at once (resource RES-G3). The table runs one video at a time and
 refuses `queue:full` and `operations:full` past its bounds.
 
-## KIT-V2 — The model set's bounds
+## [KIT-V2] The model set's bounds
 
 A request is resolved to the set's preset for size auto and rate zero, its
 frames aligned to 4n+1; a value outside video@1 is invalid, and one outside
 the set's sizes, frames, rate or first-frame use is unsupported_feature.
 
-## KIT-V3 — The first frame
+## [KIT-V3] The first frame
 
 A first frame is read from the provider's own store by digest and becomes the
 provider's own PNG of the exact size; a digest the store does not hold is
 `content:unknown`, and nothing is generated from the prompt alone.
 
-## KIT-V4 — Cancel
+## [KIT-V4] Cancel
 
 A queued video leaves the queue; a running one is stopped by its kind, which
 reads the operation's cancel.
 
-## KIT-V5 — Retention
+## [KIT-V5] Retention
 
 An ended operation and its request_id stay held for the retention, at least
 24 hours; its result is removed from the store with it unless another held
@@ -272,14 +273,14 @@ last publication unless a content call named it within a reader's idle
 lifetime. PyTorch's image path uses it. Other `OutputWriter` providers keep
 their outputs until they turn it on.
 
-## KIT-V6 — The GPU around a video
+## [KIT-V6] The GPU around a video
 
 A video waits while the machine is in Modern Standby or the driver is coming
 back from a reset, holds the wake lease while it runs (resource RES-G5), and
 reads `gpu:reset` and quarantines its fingerprint when its engine is lost in
 a recorded reset; any other loss reads `engine:lost`.
 
-## KIT-Q1 — The GPU quarantine commands
+## [KIT-Q1] The GPU quarantine commands
 
 A provider's `gpu list` prints each request its GPU fault handling paused
 after a driver reset, with its key, strikes, until when and what it
@@ -287,7 +288,7 @@ dispatches, and names a damaged quarantine file with where it was moved;
 `gpu clear KEY` (or `--all`) lets a paused request run again (resource
 RES-G3). Only a person runs them.
 
-## KIT-E1 — The runtime programs a provider admits
+## [KIT-E1] The runtime programs a provider admits
 
 A provider's endpoint admits the runtime programs its installation names: the
 installed runtime beside the provider (both forms on Windows), or the clean
@@ -355,8 +356,8 @@ that does not decode are refused before the request leaves the provider.
 Image work may reach stable-diffusion.cpp's `sd-server` through any
 OpenAI-compatible model server: Lemonade runs it for its image routes, and
 `sd-server` serves the OpenAI routes itself. The conditions of the
-[stable-diffusion.cpp master-843-462d675 review](../../research/security-reviews/stable-diffusion.cpp-master-843-462d675.md)
-and its [video addendum](../../research/security-reviews/stable-diffusion.cpp-master-843-462d675-video-addendum.md)
+stable-diffusion.cpp master-843-462d675 review (`../../research/security-reviews/stable-diffusion.cpp-master-843-462d675.md`)
+and its video addendum (`../../research/security-reviews/stable-diffusion.cpp-master-843-462d675-video-addendum.md`)
 that concern request text and size are held once in the provider kit
 `go/sdcpp`. Inference applies them to every image request, and
 the Lemonade provider applies them again to each body it forwards.
