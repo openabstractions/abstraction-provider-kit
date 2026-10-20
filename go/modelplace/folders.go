@@ -1,6 +1,7 @@
 package modelplace
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 
+	config "github.com/openabstractions/abstraction-config/go"
+	"github.com/openabstractions/abstraction-identity/fileid"
 	"github.com/openabstractions/abstraction-identity/go/privatedir"
 )
 
@@ -39,17 +42,33 @@ func AdoptSetFolders(root string, linkRoots []string, files []File, found map[st
 	if root == "" {
 		return nil
 	}
+	heldRoot, err := fileid.Open(context.Background(), fileid.Self, root, fileid.Options{})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer heldRoot.Close()
 	done := map[string]bool{}
 	for _, f := range files {
 		dir := SetFolderOf(root, found[f.Name])
-		if dir == "" || done[placeKey(dir)] {
+		if dir == "" {
 			continue
 		}
-		done[placeKey(dir)] = true
-		if _, err := AdoptModelFolder(root, dir, linkRoots); err != nil {
+		key, err := modelFolderKey(dir)
+		if err != nil {
 			return err
 		}
-		if adopted != nil {
+		if done[key] {
+			continue
+		}
+		done[key] = true
+		ok, err := adoptModelFolder(root, dir, linkRoots, heldRoot)
+		if err != nil {
+			return err
+		}
+		if ok && adopted != nil {
 			adopted(dir)
 		}
 	}
@@ -63,21 +82,36 @@ func AdoptSetFolders(root string, linkRoots []string, files []File, found map[st
 // and each recorded folder is reported as it stands. It returns how many
 // recorded folders were refused (KIT-M3).
 func ProtectFolders(root string, recorded, linkRoots []string, dryRun bool, out io.Writer) (int, error) {
-	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) {
+		return 0, fmt.Errorf("%w: models root must be absolute", privatedir.ErrNotModelFolder)
+	}
+	heldRoot, err := fileid.Open(context.Background(), fileid.Self, root, fileid.Options{Links: fileid.RefuseLinks, Read: true})
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", privatedir.ErrNotModelFolder, err)
+	}
+	defer heldRoot.Close()
 	if err := privatedir.CheckModelsRoot(root); err != nil {
 		return 0, err
 	}
 	isRecorded := map[string]bool{}
 	for _, dir := range recorded {
-		isRecorded[placeKey(dir)] = true
+		key, err := modelFolderKey(dir)
+		if err != nil {
+			return 0, err
+		}
+		isRecorded[key] = true
 	}
-	entries, err := os.ReadDir(root)
+	entries, err := heldRoot.File().ReadDir(-1)
 	if err != nil {
 		return 0, err
 	}
 	for _, e := range entries {
 		dir := filepath.Join(root, e.Name())
-		if !isRecorded[placeKey(dir)] {
+		key, err := modelFolderKey(dir)
+		if err != nil {
+			return 0, err
+		}
+		if !isRecorded[key] {
 			//unchecked: CLI output; the caller's exit code reports the run
 			fmt.Fprintf(out, "%s: not a recorded set; left as it is\n", dir)
 		}
@@ -93,8 +127,12 @@ func ProtectFolders(root string, recorded, linkRoots []string, dryRun bool, out 
 			fmt.Fprintf(out, "%s: %s\n", dir, state)
 			continue
 		}
-		if _, err := AdoptModelFolder(root, dir, linkRoots); err != nil {
+		ok, err := adoptModelFolder(root, dir, linkRoots, heldRoot)
+		if err != nil || !ok {
 			failed++
+			if err == nil {
+				err = fmt.Errorf("%w: not a set folder directly under the models root", privatedir.ErrNotModelFolder)
+			}
 			//unchecked: CLI output; the caller's exit code reports the run
 			fmt.Fprintf(out, "%s: refused: %v\n", dir, err)
 			continue
@@ -105,28 +143,109 @@ func ProtectFolders(root string, recorded, linkRoots []string, dryRun bool, out 
 	return failed, nil
 }
 
-// DefaultJobStore is the runtime's managed job store, OA's other folder a
-// model file may share a name with (LinkResult, JOB-A17): runtime-v1\jobs
-// under the per-user data folder, as the runtime's managedJobRoot names it.
-func DefaultJobStore(getenv func(string) string) string {
-	var base string
-	switch runtime.GOOS {
-	case "windows":
-		base = getenv("LOCALAPPDATA")
-	case "darwin":
-		if h := getenv("HOME"); h != "" {
-			base = filepath.Join(h, "Library", "Application Support")
-		}
-	default:
-		base = getenv("XDG_DATA_HOME")
-		if base == "" {
-			if h := getenv("HOME"); h != "" {
-				base = filepath.Join(h, ".local", "share")
-			}
-		}
+// Adoption deduplication is request-local and uses native identity. The
+// shared candidate placeKey retains its separate missing-file semantics.
+func modelFolderKey(p string) (string, error) {
+	if err := fileid.OlderPath(p); err != nil {
+		return "", err
 	}
-	if base == "" || !filepath.IsAbs(base) {
+	id, err := fileid.Resolve(context.Background(), fileid.Self, p, fileid.Options{})
+	if errors.Is(err, os.ErrNotExist) {
+		pending, pendingErr := fileid.Pending(context.Background(), fileid.Self, p)
+		if pendingErr != nil {
+			return "", pendingErr
+		}
+		return pending.Key(), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return id.Key(), nil
+}
+
+// RuntimeStateFor is the runtime's per-user state folder: runtime-v1 under
+// config.DataDirFor. The runtime keeps its managed job store in it
+// (JobStoreIn).
+func RuntimeStateFor(platform string, getenv func(string) string, home func() (string, error)) (string, error) {
+	base, err := config.DataDirFor(platform, getenv, home)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "runtime-v1"), nil
+}
+
+// JobStoreIn is the managed job store of the runtime whose state folder is
+// state.
+func JobStoreIn(state string) string { return filepath.Join(state, "jobs") }
+
+// DefaultJobStore is the runtime's managed job store, OA's other folder a
+// model file may share a name with (LinkResult, JOB-A17): JobStoreIn the
+// per-user RuntimeStateFor. It is "" when this environment names no data
+// folder.
+func DefaultJobStore(getenv func(string) string) string {
+	return defaultJobStoreFor(runtime.GOOS, getenv)
+}
+
+func defaultJobStoreFor(platform string, getenv func(string) string) string {
+	// Retain the existing XDG mapping for every non-Windows/macOS provider.
+	if platform != "windows" && platform != "darwin" {
+		platform = "linux"
+	}
+	state, err := RuntimeStateFor(platform, getenv, func() (string, error) {
+		return getenv("HOME"), nil
+	})
+	if err != nil {
 		return ""
 	}
-	return filepath.Join(base, "openabstractions", "runtime-v1", "jobs")
+	return JobStoreIn(state)
+}
+
+// OwnedRoots are OA's own folders, beside the models root a set folder lies
+// under, where the job service creates another name of a model file: the
+// runtime's job store, whose results LinkResult hard-links into a stage
+// (JOB-A17). They are the linkRoots every AdoptSetFolders and ProtectFolders
+// caller passes; the models root itself is always admitted. A folder this
+// environment does not resolve is left out, so a staged file's job-store
+// name is then refused (KIT-M3).
+func OwnedRoots(getenv func(string) string) []string {
+	return ownedRoots(DefaultJobStore(getenv))
+}
+
+func ownedRoots(jobStore string) []string {
+	if jobStore == "" {
+		return nil
+	}
+	return []string{filepath.Clean(jobStore)}
+}
+
+// JobStoreFlag is a models command's --job-store: the job store of a runtime
+// that keeps its state elsewhere. Set refuses an empty or relative folder, so
+// a command line can never drop the job store from OA's own roots.
+type JobStoreFlag struct{ dir string }
+
+func (f *JobStoreFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return f.dir
+}
+
+func (f *JobStoreFlag) Set(v string) error {
+	if v == "" {
+		return errors.New("an empty job store would refuse every file the job service staged; omit the flag for the runtime's own")
+	}
+	if !filepath.IsAbs(v) {
+		return errors.New("the job store must be an absolute folder")
+	}
+	f.dir = filepath.Clean(v)
+	return nil
+}
+
+// OwnedRoots are OwnedRoots(getenv) with the job store the flag names in
+// place of the runtime's default one.
+func (f *JobStoreFlag) OwnedRoots(getenv func(string) string) []string {
+	if f == nil || f.dir == "" {
+		return OwnedRoots(getenv)
+	}
+	return ownedRoots(f.dir)
 }

@@ -10,12 +10,26 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 	"unsafe"
 
 	identity "github.com/openabstractions/abstraction-identity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
+
+// A Windows reader without delete sharing can briefly block replacing the manifest.
+func retryManifestRename(rename func() error) error {
+	waits := [...]time.Duration{25 * time.Millisecond, 75 * time.Millisecond, 150 * time.Millisecond, 250 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		err := rename()
+		if attempt == len(waits) ||
+			!errors.Is(err, windows.ERROR_ACCESS_DENIED) && !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			return err
+		}
+		time.Sleep(waits[attempt])
+	}
+}
 
 var (
 	userenv              = windows.NewLazySystemDLL("userenv.dll")
@@ -26,8 +40,7 @@ var (
 	hresultAlreadyExists = uint32(0x800700B7)
 )
 
-// The access masks a grant writes, as specific file rights so an entry the
-// system copies to what a folder holds reads the same.
+// The access masks a grant writes as specific file rights on each object.
 const (
 	maskReadExecute = windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE
 	maskModify      = maskReadExecute | windows.FILE_GENERIC_WRITE | windows.DELETE
@@ -372,7 +385,12 @@ func snapshot(path string) (string, error) {
 }
 
 func snapshotID(path, expectedID string) (string, error) {
-	sd, _, err := daclOfID(path, expectedID)
+	f, err := openACL(path, false, expectedID)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sd, err := windows.GetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return "", err
 	}
@@ -418,43 +436,78 @@ func withoutSID(sddl string, sid *windows.SID) (string, error) {
 	return out.String(), nil
 }
 
-// changeACL grants sid access on path (inherited by what a folder holds), or
-// revokes every entry for sid there with mode REVOKE_ACCESS; the system
-// carries the change to what the folder holds.
+// sameSnapshot compares every recorded field. A historical DACL-only snapshot
+// supplies no owner/group evidence; present owner/group fields remain strict.
+func sameSnapshot(before, after string, sid *windows.SID) (bool, error) {
+	old, err := windows.SecurityDescriptorFromString(before)
+	if err != nil {
+		return false, err
+	}
+	current, err := windows.SecurityDescriptorFromString(after)
+	if err != nil {
+		return false, err
+	}
+	for _, field := range []func(*windows.SECURITY_DESCRIPTOR) (*windows.SID, bool, error){(*windows.SECURITY_DESCRIPTOR).Owner, (*windows.SECURITY_DESCRIPTOR).Group} {
+		expected, _, err := field(old)
+		if err != nil {
+			return false, err
+		}
+		if expected != nil {
+			actual, _, err := field(current)
+			if err != nil {
+				return false, err
+			}
+			if actual == nil || !expected.Equals(actual) {
+				return false, nil
+			}
+		}
+	}
+	a, err := daclSDDL(old)
+	if err != nil {
+		return false, err
+	}
+	b, err := daclSDDL(current)
+	if err != nil {
+		return false, err
+	}
+	a, err = withoutSID(a, sid)
+	if err != nil {
+		return false, err
+	}
+	b, err = withoutSID(b, sid)
+	return a == b, err
+}
+
+// changeACL edits only sid on each checked object in a no-link tree walk.
+// REVOKE_ACCESS removes that SID while preserving every other entry and control.
 func changeACL(path string, sid *windows.SID, access windows.ACCESS_MASK, tree bool, mode windows.ACCESS_MODE) error {
 	return changeACLID(path, "", sid, access, tree, mode)
 }
 
 func changeACLID(path, expectedID string, sid *windows.SID, access windows.ACCESS_MASK, tree bool, mode windows.ACCESS_MODE) error {
-	f, err := openACL(path, true, expectedID)
-	if err != nil {
-		return fmt.Errorf("sandbox: open the access list of %s: %w", path, err)
+	operation, kind := "revoke", ReadExecute
+	if mode == windows.GRANT_ACCESS {
+		operation = "grant"
+		switch access {
+		case mask(ReadExecute):
+			kind = ReadExecute
+		case mask(ReadExecuteAttributes):
+			kind = ReadExecuteAttributes
+		case mask(Modify):
+			kind = Modify
+		default:
+			return errors.New("sandbox: unsupported ACL access")
+		}
+	} else if mode != windows.REVOKE_ACCESS {
+		return errors.New("sandbox: unsupported ACL edit")
 	}
-	defer f.Close()
-	sd, err := windows.GetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	held, err := captureTree(path, expectedID, kind, tree, operation)
 	if err != nil {
 		return err
 	}
-	old, _, err := sd.DACL()
-	if err != nil {
-		return err
-	}
-	inherit := uint32(windows.NO_INHERITANCE)
-	if tree {
-		inherit = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
-	}
-	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: access, AccessMode: mode, Inheritance: inherit,
-		Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
-			TrusteeValue: windows.TrusteeValueFromSID(sid)},
-	}}, old)
-	if err != nil {
-		return fmt.Errorf("sandbox: build the access list of %s: %w", path, err)
-	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
-		return fmt.Errorf("sandbox: write the access list of %s: %w", path, err)
-	}
-	return nil
+	defer held.close()
+	_, err = held.apply(sid, operation)
+	return err
 }
 
 // ace is one entry of an access list.
@@ -643,6 +696,7 @@ type Setup struct {
 	manifest string
 	lock     windows.Handle
 	m        *Manifest
+	disk     *manifestDisk
 	sid      *windows.SID
 }
 
@@ -667,23 +721,28 @@ func Begin(manifest, profile string) (*Setup, error) {
 		s.Close()
 		return nil, err
 	}
-	m, err := ReadManifest(manifest)
+	disk, err := readManifestDisk(manifest)
 	switch {
 	case errors.Is(err, ErrNotInstalled):
-		m = &Manifest{Format: manifestFormat, Profile: profile}
+		disk = &manifestDisk{Manifest: Manifest{Format: manifestFormat, Profile: profile}}
 	case err != nil:
 		return fail(err)
-	case m.Profile != profile:
-		return fail(fmt.Errorf("sandbox: %s is the sandbox of the profile %s, not %s", manifest, m.Profile, profile))
+	case disk.Profile != profile:
+		return fail(fmt.Errorf("sandbox: %s is the sandbox of the profile %s, not %s", manifest, disk.Profile, profile))
 	}
+	m := &disk.Manifest
 	if !errors.Is(err, ErrNotInstalled) {
 		if err := validateManifestAuthority(m); err != nil {
 			return fail(err)
 		}
+		if err := validateTreeEdit(disk); err != nil {
+			return fail(err)
+		}
 	}
 	s.m = m
+	s.disk = disk
 	m.Phase = PhaseInstalling
-	if err := writeManifest(manifest, m); err != nil {
+	if err := writeManifestDisk(manifest, disk); err != nil {
 		return fail(err)
 	}
 	if err := step("phase"); err != nil {
@@ -695,7 +754,7 @@ func Begin(manifest, profile string) (*Setup, error) {
 	}
 	s.sid = sid
 	m.SID = sid.String()
-	if err := writeManifest(manifest, m); err != nil {
+	if err := writeManifestDisk(manifest, disk); err != nil {
 		return fail(err)
 	}
 	if err := step("profile"); err != nil {
@@ -710,7 +769,7 @@ func (s *Setup) SID() string { return s.m.SID }
 // Grant applies each grant once: a path new to the manifest is recorded
 // with its access list's snapshot before it is changed; a path already
 // granted is granted again, so files an update put in a granted folder
-// inherit the grant. A grant only ever widens: a path granted Modify stays
+// receive the grant. A grant only ever widens: a path granted Modify stays
 // so when asked for ReadExecute.
 func (s *Setup) Grant(grants ...Grant) error {
 	return s.grant(grants, "")
@@ -726,6 +785,11 @@ func (s *Setup) GrantBound(grant Grant, expectedID string) error {
 }
 
 func (s *Setup) grant(grants []Grant, expectedID string) error {
+	if s.disk.TreeEdit != nil {
+		if _, err := editManifestTree(s.manifest, s.disk, s.sid, s.disk.TreeEdit.Mode, nil); err != nil {
+			return err
+		}
+	}
 	for _, g := range grants {
 		if !g.Access.valid() || g.Access == Attributes {
 			return fmt.Errorf("sandbox: %q is no access Grant applies; GrantAncestorAttributes writes Attributes", g.Access)
@@ -758,8 +822,41 @@ func (s *Setup) grant(grants []Grant, expectedID string) error {
 				inside, err := identity.Within(g.Path, e.Path)
 				return err == nil && inside && e.Tree
 			})
+			if !parentOwned {
+				holders, err := Holders(g.Path, s.m.SID)
+				if err != nil {
+					return err
+				}
+				for _, holder := range holders {
+					owned := false
+					for _, recorded := range s.m.Grants {
+						actualID, err := identity.FileKey(recorded.Path)
+						if err != nil {
+							return err
+						}
+						if actualID != recorded.ID {
+							return fmt.Errorf("sandbox: %s changed file identity since its first grant", recorded.Path)
+						}
+						same, err := identity.SameFile(holder, recorded.Path)
+						if err != nil {
+							return err
+						}
+						inside, err := identity.Within(holder, recorded.Path)
+						if err != nil {
+							return err
+						}
+						if same || (inside && recorded.Tree) {
+							owned = true
+							break
+						}
+					}
+					if !owned {
+						return fmt.Errorf("sandbox: %s already grants this container outside a recorded grant; its original access list cannot be restored", holder)
+					}
+				}
+			}
 			for _, a := range list {
-				if a.sid == s.m.SID && (a.flags&windows.INHERITED_ACE == 0 || !parentOwned) {
+				if a.sid == s.m.SID && !parentOwned {
 					return fmt.Errorf("sandbox: %s already grants this container outside its recorded parent; its original access list cannot be restored", g.Path)
 				}
 			}
@@ -769,7 +866,7 @@ func (s *Setup) grant(grants []Grant, expectedID string) error {
 			}
 			s.m.Grants = append(s.m.Grants, Entry{Path: filepath.Clean(g.Path), ID: id, Access: g.Access, Tree: tree, Before: before})
 			i = len(s.m.Grants) - 1
-			if err := writeManifest(s.manifest, s.m); err != nil {
+			if err := writeManifestDisk(s.manifest, s.disk); err != nil {
 				return err
 			}
 			if err := step("recorded"); err != nil {
@@ -787,11 +884,17 @@ func (s *Setup) grant(grants []Grant, expectedID string) error {
 			}
 		}
 		e := &s.m.Grants[i]
-		if err := changeACLID(e.Path, e.ID, s.sid, mask(e.Access), e.Tree, windows.GRANT_ACCESS); err != nil {
+		held, err := captureTree(e.Path, e.ID, e.Access, e.Tree, "grant")
+		if err != nil {
+			return err
+		}
+		s.disk.TreeEdit = held.plan
+		_, err = editManifestTree(s.manifest, s.disk, s.sid, "grant", held)
+		if err != nil {
 			return err
 		}
 		e.Applied = true
-		if err := writeManifest(s.manifest, s.m); err != nil {
+		if err := writeManifestDisk(s.manifest, s.disk); err != nil {
 			return err
 		}
 		if err := step("applied"); err != nil {
@@ -803,8 +906,12 @@ func (s *Setup) grant(grants []Grant, expectedID string) error {
 
 // Commit records the phase ready and lets launches in.
 func (s *Setup) Commit() error {
+	if s.disk.TreeEdit != nil {
+		s.Close()
+		return errors.New("sandbox: a captured tree edit is unfinished")
+	}
 	s.m.Phase = PhaseReady
-	err := writeManifest(s.manifest, s.m)
+	err := writeManifestDisk(s.manifest, s.disk)
 	s.Close()
 	return err
 }
@@ -830,29 +937,37 @@ func Remove(manifest string, keepProfile bool) (*Removal, error) {
 		return nil, err
 	}
 	// Refuse a malformed or foreign authority before even creating a lock.
-	preflight, err := ReadManifest(manifest)
+	preflight, err := readManifestDisk(manifest)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateManifestAuthority(preflight); err != nil {
+	if err := validateManifestAuthority(&preflight.Manifest); err != nil {
+		return nil, err
+	}
+	if err := validateTreeEdit(preflight); err != nil {
 		return nil, err
 	}
 	lock, err := openLock(manifest, true)
 	if err != nil {
 		return nil, err
 	}
-	m, err := ReadManifest(manifest)
+	disk, err := readManifestDisk(manifest)
 	if err != nil {
 		windows.CloseHandle(lock)
 		return nil, err
 	}
+	m := &disk.Manifest
 	if err := validateManifestAuthority(m); err != nil {
+		windows.CloseHandle(lock)
+		return nil, err
+	}
+	if err := validateTreeEdit(disk); err != nil {
 		windows.CloseHandle(lock)
 		return nil, err
 	}
 	out := &Removal{Profile: m.Profile}
 	m.Phase = PhaseRemoving
-	if err := writeManifest(manifest, m); err != nil {
+	if err := writeManifestDisk(manifest, disk); err != nil {
 		windows.CloseHandle(lock)
 		return nil, err
 	}
@@ -867,6 +982,14 @@ func Remove(manifest string, keepProfile bool) (*Removal, error) {
 		return nil, err
 	}
 	var problems []error
+	if disk.TreeEdit != nil {
+		changed, err := editManifestTree(manifest, disk, sid, "revoke", nil)
+		out.Changed = append(out.Changed, changed...)
+		if err != nil {
+			windows.CloseHandle(lock)
+			return out, err
+		}
+	}
 	for i := len(m.Grants) - 1; i >= 0; i-- {
 		e := m.Grants[i]
 		if e.Access == Attributes {
@@ -879,9 +1002,18 @@ func Remove(manifest string, keepProfile bool) (*Removal, error) {
 			out.Revoked = append(out.Revoked, e.Path)
 			continue
 		}
-		if err := changeACLID(e.Path, e.ID, sid, 0, e.Tree, windows.REVOKE_ACCESS); err != nil {
+		held, err := captureTree(e.Path, e.ID, e.Access, e.Tree, "revoke")
+		if err != nil {
 			problems = append(problems, err)
 			continue
+		}
+		disk.TreeEdit = held.plan
+		changed, err := editManifestTree(manifest, disk, sid, "revoke", held)
+		out.Changed = append(out.Changed, changed...)
+		if err != nil {
+			// The one durable edit must not be replaced by another capture.
+			windows.CloseHandle(lock)
+			return out, errors.Join(append(problems, err)...)
 		}
 		out.Revoked = append(out.Revoked, e.Path)
 	}
@@ -896,11 +1028,10 @@ func Remove(manifest string, keepProfile bool) (*Removal, error) {
 				problems = append(problems, err)
 				continue
 			}
-			beforeComparable, beforeErr := withoutSID(e.Before, sid)
-			afterComparable, afterErr := withoutSID(after, sid)
-			if err := errors.Join(beforeErr, afterErr); err != nil {
+			same, err := sameSnapshot(e.Before, after, sid)
+			if err != nil {
 				problems = append(problems, err)
-			} else if beforeComparable != afterComparable {
+			} else if !same {
 				out.Changed = append(out.Changed, e.Path)
 			}
 			if namesSID(list, sid.String()) {
@@ -911,11 +1042,10 @@ func Remove(manifest string, keepProfile bool) (*Removal, error) {
 		if after, err := snapshotID(e.Path, e.ID); err != nil {
 			problems = append(problems, err)
 		} else {
-			beforeComparable, beforeErr := withoutSID(e.Before, sid)
-			afterComparable, afterErr := withoutSID(after, sid)
-			if err := errors.Join(beforeErr, afterErr); err != nil {
+			same, err := sameSnapshot(e.Before, after, sid)
+			if err != nil {
 				problems = append(problems, err)
-			} else if beforeComparable != afterComparable {
+			} else if !same {
 				out.Changed = append(out.Changed, e.Path)
 			}
 		}

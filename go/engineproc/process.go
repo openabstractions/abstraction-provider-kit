@@ -15,7 +15,7 @@ import (
 	"time"
 
 	identity "github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
 )
 
 // StopWithin bounds how long a stop waits for an engine's tree to be
@@ -76,6 +76,21 @@ func (p *Process) LendTo(f *os.File, pid int) (uintptr, error) {
 		return 0, fmt.Errorf("engineproc: lend needs a file")
 	}
 	return p.lend(f.Fd(), fileReadAccess, pid)
+}
+
+// LendHandle duplicates h, a handle of this process, into pid, a live
+// member of the engine's owned tree, with exactly access, and returns its
+// value there (facade FAC-P4): a sealed model section with map-read and
+// query access, or a lease pipe's write end (provider kit KIT-MB1). The
+// caller keeps h.
+func (p *Process) LendHandle(h uintptr, access uint32, pid int) (uintptr, error) {
+	if p == nil || p.lend == nil {
+		return 0, fmt.Errorf("engineproc: this platform lends no handle to an engine")
+	}
+	if p.Gone() {
+		return 0, fmt.Errorf("engineproc: the engine has ended")
+	}
+	return p.lend(h, access, pid)
 }
 
 // PID is the process id the provider started.
@@ -140,6 +155,12 @@ type Spec struct {
 	Stdin, Stdout *os.File
 	Output        io.Writer
 	MemoryLimit   uint64
+	// Inherit forwards additional Windows handles to supervision.Options.Inherit
+	// under FAC-P1: the caller selects, holds and marks each handle inheritable,
+	// retains ownership, and may close it after Start. The child receives only
+	// these handles and its standard streams. Other platforms refuse a nonempty
+	// list; no descriptor remapping or model-supplied handle selection occurs.
+	Inherit []uintptr
 	// Engine and Model name the start in its exit record; Exited, when
 	// set, receives that record once the engine's tree has ended
 	// (KIT-P3). Provider names the provider in the record and its log line.
@@ -162,7 +183,22 @@ var ErrEnvironment = fmt.Errorf("engineproc: an engine starts only from a clean 
 // which ends it once every answer for enginehttp.UnreachableFor was that
 // error (enginehttp.UnreachableRun, KIT-P5).
 func Wait(ctx context.Context, p *Process, budget time.Duration, ready func(context.Context) (bool, error)) error {
-	deadline := time.Now().Add(budget)
+	return waitReadiness(ctx, p, budget, ready, nil)
+}
+
+// waitReadiness gives each observed progress advance a fresh stall budget.
+// A probe or heartbeat alone never advances progress. Nil retains Wait's
+// fixed budget for consumers that declare no progress source.
+func waitReadiness(ctx context.Context, p *Process, budget time.Duration, ready func(context.Context) (bool, error), progress func() uint64) error {
+	return waitReadinessAt(ctx, p, budget, ready, progress, time.Now)
+}
+
+func waitReadinessAt(ctx context.Context, p *Process, budget time.Duration, ready func(context.Context) (bool, error), progress func() uint64, now func() time.Time) error {
+	deadline := now().Add(budget)
+	var last uint64
+	if progress != nil {
+		last = progress()
+	}
 	var run enginehttp.UnreachableRun
 	for {
 		select {
@@ -182,7 +218,16 @@ func Wait(ctx context.Context, p *Process, budget time.Duration, ready func(cont
 		if healthy {
 			return nil
 		}
-		if !time.Now().Before(deadline) {
+		if progress != nil {
+			if next := progress(); next > last {
+				last = next
+				deadline = now().Add(budget)
+			}
+		}
+		if !now().Before(deadline) {
+			if progress != nil {
+				return fmt.Errorf("engine readiness stalled for %s", budget)
+			}
 			return fmt.Errorf("the engine was not ready within %s", budget)
 		}
 		timer := time.NewTimer(readyPoll)

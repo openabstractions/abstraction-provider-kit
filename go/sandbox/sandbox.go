@@ -119,7 +119,29 @@ type Manifest struct {
 }
 
 // manifestFormat is the manifest's layout version.
-const manifestFormat = 2
+const manifestFormat = 3
+
+// The disk envelope carries an unfinished native tree edit without extending
+// the public Manifest or Entry records. Format 2 never carries this evidence.
+type manifestDisk struct {
+	Manifest
+	TreeEdit *treeEdit `json:"treeEdit,omitempty"`
+	Legacy   bool      `json:"legacyOriginals,omitempty"`
+}
+
+type treeObject struct {
+	Path      string `json:"path"`
+	ID        string `json:"id"`
+	Directory bool   `json:"directory"`
+	Before    string `json:"before"`
+}
+
+type treeEdit struct {
+	Root    string       `json:"root"`
+	Access  Access       `json:"access"`
+	Mode    string       `json:"mode"`
+	Objects []treeObject `json:"objects"`
+}
 
 // The refusals.
 var (
@@ -205,6 +227,14 @@ func ApplicationProfileName(application, label string) (string, error) {
 
 // ReadManifest reads the manifest at path.
 func ReadManifest(path string) (*Manifest, error) {
+	disk, err := readManifestDisk(path)
+	if err != nil {
+		return nil, err
+	}
+	return &disk.Manifest, nil
+}
+
+func readManifestDisk(path string) (*manifestDisk, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("sandbox: the manifest %q is not an absolute path", path)
 	}
@@ -218,12 +248,16 @@ func ReadManifest(path string) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	var m Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	var disk manifestDisk
+	if err := json.Unmarshal(data, &disk); err != nil {
 		return nil, fmt.Errorf("sandbox: the manifest %s: %w", path, err)
 	}
-	if m.Format != manifestFormat {
+	m := &disk.Manifest
+	if m.Format != 2 && m.Format != manifestFormat {
 		return nil, fmt.Errorf("sandbox: the manifest %s has format %d, not %d", path, m.Format, manifestFormat)
+	}
+	if m.Format == 2 && (disk.TreeEdit != nil || disk.Legacy) || m.Phase == PhaseReady && disk.TreeEdit != nil {
+		return nil, fmt.Errorf("sandbox: the manifest %s has incompatible tree recovery evidence", path)
 	}
 	for _, e := range m.Grants {
 		if !filepath.IsAbs(e.Path) || e.ID == "" || !e.Access.valid() {
@@ -233,13 +267,17 @@ func ReadManifest(path string) (*Manifest, error) {
 			return nil, fmt.Errorf("sandbox: the manifest %s names the grant %q: %w", path, e.Path, err)
 		}
 	}
-	return &m, nil
+	return &disk, nil
 }
 
 // writeManifest replaces the manifest at path whole: a reader sees the old
 // one or the new one.
 func writeManifest(path string, m *Manifest) error {
-	data, err := json.MarshalIndent(m, "", "  ")
+	return writeManifestDisk(path, &manifestDisk{Manifest: *m})
+}
+
+func writeManifestDisk(path string, disk *manifestDisk) error {
+	data, err := json.MarshalIndent(disk, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -255,7 +293,7 @@ func writeManifest(path string, m *Manifest) error {
 		os.Remove(temp.Name())
 		return err
 	}
-	if err := os.Rename(temp.Name(), path); err != nil {
+	if err := retryManifestRename(func() error { return os.Rename(temp.Name(), path) }); err != nil {
 		//unchecked: the rename failure is the error returned
 		os.Remove(temp.Name())
 		return err

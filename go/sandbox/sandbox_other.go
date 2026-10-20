@@ -2,6 +2,8 @@
 
 package sandbox
 
+func retryManifestRename(rename func() error) error { return rename() }
+
 // No platform but Windows has AppContainers; every call is refused
 // (KIT-S6). An engine on another platform runs with no OS-level network
 // containment from this package.

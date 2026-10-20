@@ -427,13 +427,34 @@ func TestAncestorAttributesOnARealTree(t *testing.T) {
 			t.Fatalf("%s changed by removal: %q (%v), was %q", p, after, err, want)
 		}
 	}
-	// Control: the propagating writer the kit uses for folder grants rewrites
-	// the stale sibling when it changes the parent alone.
+	// Control: the old propagating primitive rewrites the stale sibling when
+	// it changes the parent alone. The kit's nonpropagating writer must not.
 	guests, err := windows.StringToSid("S-1-5-32-546")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := changeACL(a, guests, maskAttributes, false, windows.GRANT_ACCESS); err != nil {
+	f, err := openACL(a, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := windows.GetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	old, _, err := sd.DACL()
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{AccessPermissions: maskAttributes, AccessMode: windows.GRANT_ACCESS, Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, TrusteeValue: windows.TrusteeValueFromSID(guests)}}}, old)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	err = windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+	f.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if after, err := snapshot(sibling); err != nil || after == untouched[sibling] {
@@ -466,7 +487,7 @@ func TestReadExecuteAttributesAccess(t *testing.T) {
 
 // TestReadExecuteAttributesGrantWithAFakeWriter: a package granted rxa
 // covers the folders below it, so a project nested in it owes Attributes only
-// above the package; what the package holds inherits read-execute plus write
+// above the package; each held object receives read-execute plus write
 // attributes, which a launch checks; removal restores it (KIT-S2, KIT-S7).
 func TestReadExecuteAttributesGrantWithAFakeWriter(t *testing.T) {
 	r := newAncestorRig(t)
@@ -511,14 +532,17 @@ func TestReadExecuteAttributesGrantWithAFakeWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var inherited uint32
+	var granted uint32
 	for _, a := range list {
-		if a.sid == sid && a.flags&windows.INHERITED_ACE != 0 {
-			inherited |= a.mask
+		if a.sid == sid {
+			if a.kind != windows.ACCESS_ALLOWED_ACE_TYPE || a.flags != 0 {
+				t.Fatalf("the module has an unexpected own grant: %+v", a)
+			}
+			granted |= a.mask
 		}
 	}
-	if want := uint32(mask(ReadExecuteAttributes)); inherited&want != want {
-		t.Fatalf("the module inherits %#x, want %#x", inherited, want)
+	if want := uint32(mask(ReadExecuteAttributes) | mask(Modify)); granted != want {
+		t.Fatalf("the module's explicit grant is %#x, want %#x", granted, want)
 	}
 	l, err := Prepare(r.manifest, []Grant{{Path: pkg, Access: ReadExecuteAttributes}, {Path: module, Access: ReadExecute}})
 	if err != nil {

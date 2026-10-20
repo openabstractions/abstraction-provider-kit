@@ -53,6 +53,7 @@ func Start(spec Spec) (*Process, error) {
 	child, err := supervision.Start(context.Background(), supervision.Options{
 		Executable: spec.Program, Args: spec.Args, Env: spec.Env, Stdin: spec.Stdin, Stdout: stdout, Stderr: stream, Dir: dir,
 		ForceTimeout: 20 * time.Second, ProcessMemoryLimit: spec.MemoryLimit, Container: spec.Container,
+		Inherit: spec.Inherit,
 	})
 	if reader != nil {
 		_ = stream.Close()

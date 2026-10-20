@@ -11,6 +11,18 @@ import (
 	"testing"
 )
 
+func TestBareContentDigestKeepsOtherHexLengths(t *testing.T) {
+	good := strings.Repeat("a", 64)
+	for _, value := range []string{good, "", good[:63], good + "a", strings.ToUpper(good), strings.Repeat("g", 64), "sha256:" + good, " " + good} {
+		if LowerHex(value, 64) != (value == good) {
+			t.Fatalf("bare content digest %q", value)
+		}
+	}
+	if !LowerHex(strings.Repeat("b", 40), 40) || !LowerHex("ab", 2) || !LowerHex("", 0) || LowerHex("AB", 2) {
+		t.Fatal("non-SHA256 caller grammar changed")
+	}
+}
+
 func pinned(t *testing.T, dir, name, role string, data []byte) File {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {

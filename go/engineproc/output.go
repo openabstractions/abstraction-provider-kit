@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/devicelost"
+	"github.com/openabstractions/abstraction-provider-kit/go/devicelost"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 )
 

@@ -10,7 +10,7 @@ import (
 
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	"github.com/openabstractions/abstraction-resource/go/holder"
@@ -25,7 +25,11 @@ func (noLeases) Acquire(string, int64, time.Duration) (res.AcquireResult, error)
 func (noLeases) BindProcess(string, int) (res.ProcessBindResult, error) {
 	return res.ProcessBindResult{}, nil
 }
-func (noLeases) Renew(string) (res.LeaseChange, error)   { return res.LeaseChange{}, nil }
+func (noLeases) Renew(string) (res.LeaseChange, error) { return res.LeaseChange{}, nil }
+func (noLeases) Label(string, string) (res.LeaseChange, error) {
+	return res.LeaseChange{Applied: true}, nil
+}
+
 func (noLeases) Release(string) (res.LeaseChange, error) { return res.LeaseChange{}, nil }
 func (noLeases) Observe(ctx context.Context, _ string, _ time.Duration) (res.YieldPage, error) {
 	<-ctx.Done()

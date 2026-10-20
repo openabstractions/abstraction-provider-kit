@@ -3,6 +3,8 @@ package refusal
 import (
 	"errors"
 	"fmt"
+	"github.com/openabstractions/abstraction-provider-kit/go/internal/personfolders"
+	"os"
 	"testing"
 	"time"
 
@@ -40,3 +42,6 @@ func TestALoadRefusalReadsOneWord(t *testing.T) {
 		t.Fatalf("GPU %v", gpu)
 	}
 }
+
+// TestMain confines per-user folders to the canonical owned test fixture.
+func TestMain(m *testing.M) { os.Exit(personfolders.Main(m)) }

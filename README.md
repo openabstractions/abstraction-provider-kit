@@ -7,6 +7,14 @@ supervises the process, refuses loads in one vocabulary, proves model files
 in place and runs video@1 operations. The rules are in
 [CONTRACT.md](CONTRACT.md) (page code `KIT`).
 
+Provider authors also keep its [reviewed engine bindings](CONTRACT.md#reviewed-engine-bindings):
+[llama.cpp](CONTRACT.md#llamacpp), [stable-diffusion.cpp](CONTRACT.md#stable-diffusioncpp),
+[whisper.cpp](CONTRACT.md#whispercpp), [Kokoros](CONTRACT.md#kokoros) and
+[platform video encoding](CONTRACT.md#video-encoding). These clauses retain their
+historical `INF-` rule IDs. The inference contract's former section addresses
+forward to this owner. Shared engine implementations use this module's Go packages.
+[The 0.8 migration guide](MIGRATING-0.8.md) maps every former providerhost path.
+
 **What's new here:** The model host and the PyTorch provider start, supervise
 and stop their engines with the same code: on Windows the engine runs in a job with a
 memory limit and ends as one process tree, every end leaves one exit record,
@@ -16,6 +24,7 @@ copied.
 | Package | What it owns |
 |---|---|
 | `engineproc` | The engine process: Windows job with a memory limit, clean environment, bounded log, exit record, device-lost line, the AppContainer it starts in, a read-only handle lent to it, and `Owned` for the resource kit's `holder` |
+| `modelobserver` | One observer for declared existing model servers: a bounded listing with verified listener-program evidence where supported, explicit unverified presence on macOS/IPv6, and no program start or resource lease |
 | `sandbox` | The engine's Windows AppContainer with no network: one profile per engine kind, grants applied once at install with a manifest and access-list snapshots, the launch check, and removal that restores every access list |
 | `refusal` | The typed refusal and the words of a refused load |
 | `modelplace` | Pinned model files found, proved in place and recorded; OA's model folders and `models protect` |
@@ -66,6 +75,14 @@ entrypoint and install-before-launch/shared-launch-lock lifecycle stay the same.
 folder and its descendants. The application keeps its approval/effect record
 outside every guest-granted tree and removes its grants after confirmed exit.
 
-The provider kit packages inside `abstraction-inference/go/providerhost`
-(`enginelaunch`, `enginefiles`, `devicelost`, `sdcpp`, `videoenc` and the
-rest) move here in a later step (architecture review 2026-10-02 D4).
+`providerhost` supplies the standard native engine provider. `enginelaunch`,
+`enginehttp`, `devicelost`, `llamacpp`, `sdcpp`, `whispercpp`, `kokoro`,
+`videoenc`, `rgbpng` and `wavfile` contain shared engine adapters and policy.
+`modelfiles`, `modelpack` and the optional `npudecode` library contain model-byte
+execution. The standalone `cmd/modelpack` operator owns packing, inspection,
+verification, restoration and rate measurement. The runtime and Panel link no
+packing/NPU codec. Generic file proofs and holds are in facade `programfiles`;
+clean environments and path counting are in facade `supervision`.
+
+[The independent image-provider example](go/examples/image-provider) composes
+the standard provider host with a one-pixel engine and an owned content store.

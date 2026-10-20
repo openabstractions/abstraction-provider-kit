@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"time"
+
+	"github.com/openabstractions/abstraction-facade/go/supervision"
 )
 
 // Start starts spec's program as a direct child outside Windows, which has
@@ -17,6 +19,9 @@ import (
 func Start(spec Spec) (*Process, error) {
 	if len(spec.Env) == 0 {
 		return nil, ErrEnvironment
+	}
+	if len(spec.Inherit) != 0 {
+		return nil, supervision.ErrUnsupported
 	}
 	if spec.MemoryLimit > 0 {
 		return nil, errors.New("a process memory limit needs the Windows job; this platform sets none")

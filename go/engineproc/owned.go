@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
 )
 
@@ -22,6 +22,9 @@ type Owned struct {
 	// ReadyWithin bounds the readiness Probe answers.
 	ReadyWithin time.Duration
 	Probe       func(context.Context) (bool, error)
+	// Progress is a monotonic count of genuine readiness progress. When set,
+	// ReadyWithin bounds a stall; unchanged probes and heartbeats extend nothing.
+	Progress func() uint64
 	// Sockets is the engine's socket rule (inference INF-EL2), checked at
 	// readiness and every Watch while it runs; nil checks none. SocketWord is
 	// its refusal word.
@@ -46,7 +49,7 @@ func (o *Owned) PID() int { return o.Process.PID() }
 // refusal here is a failed readiness: the holder stops the engine and
 // releases the lease before the caller is told.
 func (o *Owned) Ready(ctx context.Context) error {
-	if err := Wait(ctx, o.Process, o.ReadyWithin, o.Probe); err != nil {
+	if err := waitReadiness(ctx, o.Process, o.ReadyWithin, o.Probe, o.Progress); err != nil {
 		if errors.Is(err, ErrPeer) {
 			return refusal.New(refusal.EnginePeer, "%v", err)
 		}

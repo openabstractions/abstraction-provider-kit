@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	digestfmt "github.com/openabstractions/abstraction-storage/go/digest"
 	"io"
 	"math"
 	"os"
@@ -25,7 +26,7 @@ import (
 
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	"github.com/openabstractions/abstraction-resource/go/holder"
 	storage "github.com/openabstractions/abstraction-storage/go"
@@ -88,6 +89,9 @@ type Bounds struct {
 	Sizes              [][2]int
 	MaxFrames, MaxFPS  int
 	FirstFrame         FirstFrameUse
+	// FrameStep is the frames one latent frame holds: a request's frames
+	// align to FrameStep·n+1. Zero reads Wan's 4; LTX's is 8.
+	FrameStep int
 }
 
 // Kind is the engine a video model set runs on.
@@ -317,7 +321,8 @@ func ReasonOf(err error) string {
 }
 
 // resolve turns a request into engine values: the preset's size for auto,
-// the preset's rate for zero, frames from the duration aligned to 4n+1, and
+// the preset's rate for zero, frames from the duration aligned to the
+// set's step (4n+1 for Wan, 8n+1 for LTX), and
 // a seed. A value outside video@1 is invalid; one outside the model set's
 // sizes, frames, rate or first-frame use is unsupported_feature (KIT-V2).
 func (t *Table) resolve(r wire.VideoRequest) (sdcpp.VideoParams, wire.StartOutcome, string) {
@@ -370,7 +375,7 @@ func (t *Table) resolve(r wire.VideoRequest) (sdcpp.VideoParams, wire.StartOutco
 		return p, wire.StartOutcomeUnsupportedFeature, sdcpp.ReasonVideoBound
 	}
 	frames := int(math.Ceil(float64(r.DurationMs) * float64(p.FPS) / 1000))
-	p.Frames = sdcpp.AlignFrames(frames)
+	p.Frames = sdcpp.AlignFramesTo(frames, set.FrameStep)
 	if p.Frames > set.MaxFrames || p.Frames > sdcpp.MaxVideoFrames {
 		return p, wire.StartOutcomeUnsupportedFeature, sdcpp.ReasonVideoBound
 	}
@@ -407,7 +412,7 @@ func (t *Table) firstFrame(r wire.VideoRequest, width, height int) ([]byte, wire
 		return nil, wire.StartOutcomeUnsupportedFeature, sdcpp.ReasonFirstFrame
 	}
 	sum := sha256.Sum256(data)
-	if "sha256:"+hex.EncodeToString(sum[:]) != r.ImageDigest {
+	if digestfmt.Hex(sum[:]) != r.ImageDigest {
 		return nil, wire.StartOutcomeInvalid, "content:unknown"
 	}
 	frame, err := sdcpp.FirstFrame(r.ImageMediaType, data, width, height)
@@ -648,6 +653,14 @@ func (t *Table) run(op *Op) {
 		return
 	}
 	defer end()
+	// Standby may have begun during the load: ask again before the first
+	// dispatch (RES-G5).
+	if gpu := t.opts.GPU; gpu != nil {
+		if word := t.admitGPU(ctx, gpu, op); word != "" {
+			t.Finish(op, wire.VideoStateFailed, word, nil)
+			return
+		}
+	}
 	t.kind.Run(ctx, op)
 }
 
@@ -659,7 +672,12 @@ const GPUWait = time.Second
 // coming back from a reset, and returns the word that ends op otherwise: a
 // quarantined or known-bad request, or a cancel (RES-G3..RES-G5). It returns
 // "" once op may run.
+//
+// The wait lasts at most ctx's deadline, or GPUWaitBound when it has none;
+// at the bound op ends with the guard's word, gpu:standby while the PC sleeps.
 func (t *Table) admitGPU(ctx context.Context, gpu *gpufault.Guard, op *Op) string {
+	bound := time.NewTimer(GPUWaitBound)
+	defer bound.Stop()
 	for {
 		err := gpu.AdmitRequest(ctx, op.fp)
 		var refused *gpufault.Refusal
@@ -673,12 +691,19 @@ func (t *Table) admitGPU(ctx context.Context, gpu *gpufault.Guard, op *Op) strin
 		timer := time.NewTimer(GPUWait)
 		select {
 		case <-timer.C:
+		case <-bound.C:
+			timer.Stop()
+			return refused.Word
 		case <-ctx.Done():
 			timer.Stop()
 			return refused.Word
 		}
 	}
 }
+
+// GPUWaitBound is the longest a queued video without its own deadline waits
+// for the GPU to come back from standby or a reset.
+var GPUWaitBound = 2 * time.Minute
 
 // Lost is the word a video whose engine went away fails with: gpu:reset when
 // a driver reset is recorded within the Guard's window of the loss, which

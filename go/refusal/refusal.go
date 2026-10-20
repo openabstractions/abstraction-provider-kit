@@ -38,9 +38,25 @@ const (
 	EngineUnreachable = "engine:unreachable"
 )
 
-// A Refusal is a typed refusal: the word a caller reads and the detail the
-// provider's log keeps.
-type Refusal struct{ Word, Detail string }
+// A Refusal is a typed refusal: the word a caller reads, the detail the
+// provider's log keeps and, where the word alone leaves the requesting app
+// guessing, App: the sentence that app may read. App never names another
+// program or its memory (resource RES-T4).
+type Refusal struct{ Word, Detail, App string }
+
+// ForeignMemory is the sentence the app that asked reads when memory
+// OpenAbstractions doesn't manage blocks its load. The provider's log keeps
+// the sentence naming the program and its size.
+const ForeignMemory = "Not enough memory: another program holds memory OpenAbstractions doesn't manage."
+
+// AppOf is the sentence err's refusal lets the requesting app read, or "".
+func AppOf(err error) string {
+	var r *Refusal
+	if errors.As(err, &r) {
+		return r.App
+	}
+	return ""
+}
 
 func (r *Refusal) Error() string {
 	if r.Detail == "" {
@@ -84,7 +100,13 @@ func Load(resource, name string, amount int64, err error) error {
 		case holder.WordNotPermitted:
 			return New(word, "no rule lets this provider hold %s", resource)
 		case holder.WordInsufficient:
-			return New(word, "%s has less than %s's %d-byte file-size admission estimate", resource, name, amount)
+			if sentence := foreignSentence(failure.ForeignProgram, failure.ForeignAmount); sentence != "" {
+				// The full sentence names another program and its memory,
+				// which an app reads only under table.read (RES-T4); the
+				// app that asked reads the generic one.
+				return &Refusal{Word: word, Detail: sentence, App: ForeignMemory}
+			}
+			return New(word, "not enough memory for %s (its %d-byte admission estimate) on %s even after unloading every model that could make room; nothing was unloaded", name, amount, resource)
 		case holder.WordHoldersRefused:
 			return New(word, "%s", asked(failure.Result))
 		}
@@ -94,6 +116,55 @@ func Load(resource, name string, amount int64, err error) error {
 	default:
 		return New(Unavailable, "%v", failure.Err)
 	}
+}
+
+// foreignSentence is the person's sentence for a load that foreign memory
+// blocks: the program holding it, by programTitle, and how much, with the two
+// ways to free it. "" for no foreign hold.
+func foreignSentence(program string, amount int64) string {
+	if program == "" || amount <= 0 {
+		return ""
+	}
+	name := programTitle(program)
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s holds %s that OpenAbstractions doesn't manage. Unload it in %s, or close %s.",
+		name, wholeGB(amount), name, name)
+}
+
+// programTitle is how a sentence names a program the table names by its image
+// path: the file name without .exe, with an all-lowercase name capitalized as
+// a product name is (engine.exe reads Engine). A package family reads as its
+// package name.
+func programTitle(program string) string {
+	name := program
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	if len(name) > len(".exe") && strings.EqualFold(name[len(name)-len(".exe"):], ".exe") {
+		name = name[:len(name)-len(".exe")]
+	}
+	if !strings.ContainsAny(program, `/\`) {
+		name = strings.TrimPrefix(name, "msix:")
+	}
+	if i := strings.LastIndexByte(name, '_'); i > 0 && !strings.ContainsAny(program, `/\`) {
+		name = name[:i]
+	}
+	if name != "" && name == strings.ToLower(name) && name[0] >= 'a' && name[0] <= 'z' {
+		name = string(name[0]-('a'-'A')) + name[1:]
+	}
+	return name
+}
+
+// wholeGB is bytes as whole gigabytes the way Windows counts them (2^30), at
+// least 1.
+func wholeGB(bytes int64) string {
+	gb := (bytes + 1<<29) >> 30
+	if gb < 1 {
+		gb = 1
+	}
+	return fmt.Sprintf("%d GB", gb)
 }
 
 // asked names each holder the service asked and its answer.

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
 )
 

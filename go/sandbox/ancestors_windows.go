@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,7 +53,7 @@ type handleSecurity struct{ f *os.File }
 
 func (h handleSecurity) Read() (string, string, error) {
 	handle := windows.Handle(h.f.Fd())
-	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return "", "", err
 	}
@@ -60,7 +61,7 @@ func (h handleSecurity) Read() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	dacl, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	dacl, err := daclSDDL(sd)
 	if err != nil {
 		return "", "", err
 	}
@@ -68,14 +69,46 @@ func (h handleSecurity) Read() (string, string, error) {
 	if owner != nil {
 		ownerSID = owner.String()
 	}
-	return ownerSID, dacl.String(), nil
+	return ownerSID, dacl, nil
+}
+
+// daclSDDL serializes the explicitly requested DACL component, preserving its
+// entries and control flags. Owner is returned separately by securityFile.Read;
+// ordinary grant snapshots request and retain owner/group as well.
+func daclSDDL(sd *windows.SECURITY_DESCRIPTOR) (string, error) {
+	acl, defaulted, err := sd.DACL()
+	if err != nil {
+		return "", err
+	}
+	control, _, err := sd.Control()
+	if err != nil {
+		return "", err
+	}
+	component, err := windows.NewSecurityDescriptor()
+	if err != nil {
+		return "", err
+	}
+	if err := component.SetDACL(acl, true, defaulted); err != nil {
+		return "", err
+	}
+	bits := windows.SECURITY_DESCRIPTOR_CONTROL(windows.SE_DACL_PROTECTED | windows.SE_DACL_AUTO_INHERITED | windows.SE_DACL_AUTO_INHERIT_REQ)
+	if err := component.SetControl(bits, control&bits); err != nil {
+		return "", err
+	}
+	result := component.String()
+	runtime.KeepAlive(sd)
+	if result == "" {
+		return "", errors.New("sandbox: could not serialize the DACL")
+	}
+	return result, nil
 }
 
 // WriteDACL keeps the list's control flags: the kernel marks a DACL
 // auto-inherited ("AI") only when the write asks for it with
 // SE_DACL_AUTO_INHERIT_REQ, which keeps the object's inherited entries and
 // takes the explicit ones from the new list, and protected ("P") only with
-// PROTECTED_DACL_SECURITY_INFORMATION. Neither reaches any other object.
+// PROTECTED_DACL_SECURITY_INFORMATION. Tree edits capture and verify every
+// selected child because a parent's inherited security can change them.
 func (h handleSecurity) WriteDACL(dacl string) error {
 	sd, err := windows.SecurityDescriptorFromString(dacl)
 	if err != nil {
@@ -146,6 +179,10 @@ func inheritedEntry(flags string) bool {
 // withAttributeACE inserts the Attributes entry for sid after the explicit
 // entries and before the inherited ones, the order Windows keeps.
 func withAttributeACE(dacl, sid string) (string, error) {
+	return withAllowedACE(dacl, attributeACE(sid))
+}
+
+func withAllowedACE(dacl, entry string) (string, error) {
 	if !strings.HasPrefix(dacl, "D:") || strings.Contains(dacl, "NO_ACCESS_CONTROL") {
 		return "", fmt.Errorf("sandbox: %q is no access list an entry can be added to", dacl)
 	}
@@ -160,7 +197,7 @@ func withAttributeACE(dacl, sid string) (string, error) {
 			break
 		}
 	}
-	return dacl[:at] + attributeACE(sid) + dacl[at:], nil
+	return dacl[:at] + entry + dacl[at:], nil
 }
 
 // withoutExplicit removes sid's explicit allowed entries: every one, or with
@@ -275,6 +312,10 @@ func rewriteDACL(path, id string, edit func(string) (string, error)) (bool, erro
 		return false, fmt.Errorf("sandbox: open the access list of %s: %w", path, err)
 	}
 	defer f.Close()
+	return rewriteHeldDACL(path, f, edit)
+}
+
+func rewriteHeldDACL(path string, f securityFile, edit func(string) (string, error)) (bool, error) {
 	_, dacl, err := f.Read()
 	if err != nil {
 		return false, fmt.Errorf("sandbox: read the access list of %s: %w", path, err)
@@ -377,6 +418,9 @@ func (s *Setup) ungrantedAncestors(floor string) ([]ancestor, error) {
 func (s *Setup) GrantAncestorAttributes() (*Ancestors, error) { return s.grantAncestors("") }
 
 func (s *Setup) grantAncestors(floor string) (*Ancestors, error) {
+	if s.disk.TreeEdit != nil {
+		return nil, errors.New("sandbox: finish the captured tree edit before ancestor grants")
+	}
 	ancestors, err := s.ungrantedAncestors(floor)
 	if err != nil {
 		return nil, err
@@ -409,7 +453,7 @@ func (s *Setup) grantAncestors(floor string) (*Ancestors, error) {
 			}
 			s.m.Grants = append(s.m.Grants, Entry{Path: a.path, ID: a.id, Access: Attributes, Before: dacl})
 			i = len(s.m.Grants) - 1
-			if err := writeManifest(s.manifest, s.m); err != nil {
+			if err := writeManifestDisk(s.manifest, s.disk); err != nil {
 				return nil, err
 			}
 			if err := step("recorded"); err != nil {
@@ -427,7 +471,7 @@ func (s *Setup) grantAncestors(floor string) (*Ancestors, error) {
 			return nil, err
 		}
 		e.Applied = true
-		if err := writeManifest(s.manifest, s.m); err != nil {
+		if err := writeManifestDisk(s.manifest, s.disk); err != nil {
 			return nil, err
 		}
 		if err := step("applied"); err != nil {

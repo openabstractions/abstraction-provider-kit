@@ -19,18 +19,15 @@ import (
 
 	"github.com/openabstractions/abstraction-identity/listen"
 	"github.com/openabstractions/abstraction-provider-kit/go/engineproc"
+	"github.com/openabstractions/abstraction-provider-kit/go/internal/personfolders"
+	"github.com/openabstractions/abstraction-provider-kit/go/testsupport"
 	"golang.org/x/sys/windows"
 )
 
 // TestMain runs the test binary as a contained child when the parent asks
 // for one by OA_SANDBOX_CHILD.
 func TestMain(m *testing.M) {
-	child := os.Getenv("OA_SANDBOX_CHILD")
-	if (child == "boundaries" || child == "tcp") && os.Getenv(sandboxSecurityProbeOptIn) != "1" {
-		fmt.Fprintf(os.Stderr, "refusing sandbox security child mode %q without %s=1 after explicit Daybreak clearance\n", child, sandboxSecurityProbeOptIn)
-		os.Exit(2)
-	}
-	switch child {
+	switch os.Getenv("OA_SANDBOX_CHILD") {
 	case "boundaries":
 		boundaries()
 		os.Exit(0)
@@ -42,12 +39,22 @@ func TestMain(m *testing.M) {
 	case "hang":
 		time.Sleep(time.Hour)
 		os.Exit(0)
+	case "tree-crash":
+		crashTreeEditChild()
+		os.Exit(2)
 	}
-	os.Exit(m.Run())
+	os.Exit(personfolders.Main(m))
 }
 
-func tcp() string {
-	c, err := net.DialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
+// outsideProbes names the opt-in variable for the probes that leave the
+// machine: it holds a TCP address off the machine, host:port, that answers
+// the test itself (for example 1.1.1.1:443), and enables the contained
+// child's TCP connect to it, a DNS lookup and a DNS query over UDP to the
+// host's port 53. Without it the boundaries test stays on the machine.
+const outsideProbes = testsupport.OutsideAddressEnv
+
+func tcp(address string) string {
+	c, err := net.DialTimeout("tcp", address, 3*time.Second)
 	if err != nil {
 		return "blocked"
 	}
@@ -67,25 +74,37 @@ func loopback() string {
 // boundaries is the contained child: what it can and cannot reach, as one
 // JSON line.
 func boundaries() {
-	out := map[string]string{"tcp": tcp(), "loopback": loopback()}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if _, err := net.DefaultResolver.LookupHost(ctx, "example.com"); err != nil {
-		out["dns"] = "blocked"
-	} else {
-		out["dns"] = "resolved"
-	}
-	cancel()
-	out["udp"] = "blocked"
-	if c, err := net.Dial("udp", "1.1.1.1:53"); err == nil {
-		// One DNS query for example.com; any answer means UDP left.
-		query := []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
-		if _, err := c.Write(query); err == nil {
-			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
-			if n, err := c.Read(make([]byte, 512)); err == nil && n > 0 {
-				out["udp"] = "answered"
-			}
+	out := map[string]string{"loopback": loopback(), "loopback_udp": "blocked"}
+	// A datagram to the test's loopback receiver; the receiver, not this
+	// reply, says whether it arrived.
+	if c, err := net.Dial("udp", os.Getenv("OA_LOOPBACK_UDP")); err == nil {
+		if _, err := c.Write([]byte("contained")); err == nil {
+			out["loopback_udp"] = "sent"
 		}
 		c.Close()
+	}
+	if outside := os.Getenv(outsideProbes); outside != "" {
+		out["tcp"] = tcp(outside)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, err := net.DefaultResolver.LookupHost(ctx, "example.com"); err != nil {
+			out["dns"] = "blocked"
+		} else {
+			out["dns"] = "resolved"
+		}
+		cancel()
+		out["udp"] = "blocked"
+		host, _, _ := net.SplitHostPort(outside)
+		if c, err := net.Dial("udp", net.JoinHostPort(host, "53")); err == nil {
+			// One DNS query for example.com; any answer means UDP left.
+			query := []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
+			if _, err := c.Write(query); err == nil {
+				_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+				if n, err := c.Read(make([]byte, 512)); err == nil && n > 0 {
+					out["udp"] = "answered"
+				}
+			}
+			c.Close()
+		}
 	}
 	child := exec.Command(os.Args[0])
 	child.Env = append(os.Environ(), "OA_SANDBOX_CHILD=tcp")
@@ -170,14 +189,15 @@ func childBinary(t *testing.T, r *rig) string {
 }
 
 // TestContainedEngineBoundaries: an engine started in its prepared sandbox
-// reaches no network, neither TCP nor DNS nor UDP, and nor does its child;
-// it writes its state folder; it reads nothing outside its grants, the
-// person's Documents included; it talks to an OA pipe that admits its
-// container; and it reads a file it may not open by path through a handle
-// the provider lends, without being able to write it (KIT-S3, KIT-S6;
-// identity ID-K1).
+// reaches no network, and nor does its child: nothing it sends arrives at
+// the test's loopback TCP listener or UDP receiver, and with
+// OA_PROVIDER_KIT_OUTSIDE_ADDRESS set, neither TCP to that address, nor
+// DNS, nor UDP leaves the machine. It writes its state folder; it reads
+// nothing outside its grants, the person's Documents included; it talks to
+// an OA pipe that admits its container; and it reads a file it may not
+// open by path through a handle the provider lends, without being able to
+// write it (KIT-S3, KIT-S6; identity ID-K1).
 func TestContainedEngineBoundaries(t *testing.T) {
-	requireSandboxSecurityProbeOptIn(t)
 	loop, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +208,29 @@ func TestContainedEngineBoundaries(t *testing.T) {
 	} else {
 		c.Close()
 	}
+	// The control's own connection is taken off the listener's queue, so
+	// any connection left there afterwards is the contained tree's.
+	if c, err := loop.Accept(); err != nil {
+		t.Fatalf("uncontained loopback control: %v", err)
+	} else {
+		c.Close()
+	}
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	if c, err := net.Dial("udp", udp.LocalAddr().String()); err != nil {
+		t.Fatalf("uncontained loopback UDP control: %v", err)
+	} else {
+		_, err = c.Write([]byte("control"))
+		c.Close()
+		_ = udp.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if n, _, rerr := udp.ReadFrom(make([]byte, 64)); err != nil || rerr != nil || n == 0 {
+			t.Fatalf("uncontained loopback UDP control: %v %v", err, rerr)
+		}
+	}
+	outside := testsupport.OutsideNetwork(t)
 	r := newRig(t)
 	exe := childBinary(t, r)
 	r.install(t)
@@ -222,7 +265,8 @@ func TestContainedEngineBoundaries(t *testing.T) {
 	inR, inW, _ := os.Pipe()
 	outR, outW, _ := os.Pipe()
 	var stderr bytes.Buffer
-	env := append(os.Environ(), "OA_SANDBOX_CHILD=boundaries", "OA_STATE="+r.state, "OA_OUTSIDE_FILE="+outsideFile, "OA_PIPE="+pipe, "OA_LOOPBACK="+loop.Addr().String())
+	env := append(os.Environ(), "OA_SANDBOX_CHILD=boundaries", "OA_STATE="+r.state, "OA_OUTSIDE_FILE="+outsideFile, "OA_PIPE="+pipe,
+		"OA_LOOPBACK="+loop.Addr().String(), "OA_LOOPBACK_UDP="+udp.LocalAddr().String())
 	p, err := engineproc.Start(engineproc.Spec{Program: exe, Env: env, Stdin: inR, Stdout: outW, Output: &stderr,
 		Engine: "kit-test", Model: "boundaries", Provider: "kit-test", Container: sid, MemoryLimit: 1 << 30})
 	inR.Close()
@@ -251,12 +295,29 @@ func TestContainedEngineBoundaries(t *testing.T) {
 	if err := json.Unmarshal(report, &got); err != nil {
 		t.Fatalf("the child said %q (%s)", report, stderr.String())
 	}
-	want := map[string]string{"tcp": "blocked", "loopback": "blocked", "dns": "blocked", "udp": "blocked", "child": "blocked", "state": "written",
+	want := map[string]string{"loopback": "blocked", "child": "blocked", "state": "written",
 		"documents": "denied", "outside": "denied", "pipe": "pong", "pipe_server": "denied", "lent": "x"}
+	if outside != "" {
+		want["tcp"], want["dns"], want["udp"] = "blocked", "blocked", "blocked"
+	}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("%s: %q, want %q", k, got[k], v)
 		}
+	}
+	// The listener and the receiver are the authority on what arrived: the
+	// tree's connects and its datagram ended before it exited.
+	_ = loop.(*net.TCPListener).SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if c, err := loop.Accept(); err == nil {
+		t.Errorf("the contained tree reached the loopback listener from %s", c.RemoteAddr())
+		c.Close()
+	}
+	_ = udp.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, from, err := udp.ReadFrom(make([]byte, 64)); err == nil {
+		t.Errorf("the contained tree's %d-byte datagram reached the loopback receiver from %s", n, from)
+	}
+	if t.Failed() {
+		t.Logf("the child said %v", got)
 	}
 	r.removeAll(t, sid)
 }

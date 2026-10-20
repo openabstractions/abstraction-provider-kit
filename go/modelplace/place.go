@@ -22,9 +22,11 @@ import (
 	"strings"
 
 	cas "github.com/openabstractions/abstraction-cas/go"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
+	"github.com/openabstractions/abstraction-identity/fileid"
 	"github.com/openabstractions/abstraction-identity/go/privatedir"
 	"github.com/openabstractions/abstraction-identity/go/trustedpath"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-storage/go/digest"
 
 	identity "github.com/openabstractions/abstraction-identity"
 )
@@ -61,6 +63,9 @@ type UsePolicy struct {
 
 // LowerHex reports whether s is n lower-case hex digits.
 func LowerHex(s string, n int) bool {
+	if n == 64 {
+		return digest.Valid(digest.Prefix + s)
+	}
 	if len(s) != n {
 		return false
 	}
@@ -256,6 +261,10 @@ func ParseOwners(s string) (trustedpath.Owners, bool) {
 // record, named in a refusal (KIT-M2).
 func Read(places, set string, files []File, remedy string) (map[string]string, map[string]trustedpath.Owners, error) {
 	data, err := os.ReadFile(places)
+	return readPlaces(places, set, files, remedy, data, err)
+}
+
+func readPlaces(places, set string, files []File, remedy string, data []byte, err error) (map[string]string, map[string]trustedpath.Owners, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("no record of where the %s files lie (%w); place them with %s", set, err, remedy)
 	}
@@ -284,14 +293,14 @@ func Read(places, set string, files []File, remedy string) (map[string]string, m
 
 // Placed is each of files where its places record says it lies, with its
 // owners, as enginefiles proves it in place (INF-F7).
-func Placed(places, set string, files []File, remedy string) ([]enginefiles.Placed, error) {
+func Placed(places, set string, files []File, remedy string) ([]programfiles.Placed, error) {
 	where, owners, err := Read(places, set, files, remedy)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]enginefiles.Placed, 0, len(files))
+	out := make([]programfiles.Placed, 0, len(files))
 	for _, f := range files {
-		out = append(out, enginefiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
+		out = append(out, programfiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
 	}
 	return out, nil
 }
@@ -301,7 +310,7 @@ func Placed(places, set string, files []File, remedy string) ([]enginefiles.Plac
 func Prove(ctx context.Context, f File, p string) error {
 	// A path through a junction or symbolic link could later name other
 	// bytes; a launch refuses it (INF-F7), and so does placing.
-	if err := enginefiles.CheckPlainPath(p); err != nil {
+	if err := programfiles.CheckPlainPath(p); err != nil {
 		return err
 	}
 	in, err := os.Open(p)
@@ -366,21 +375,65 @@ func ModelsRoot(home string) string { return filepath.Join(home, "OA-models") }
 // false. No file with a name outside root and linkRoots is changed, and
 // every linkRoot that exists must pass privatedir.CheckModelsRoot (KIT-M3).
 func AdoptModelFolder(root, dir string, linkRoots []string) (bool, error) {
+	return adoptModelFolder(root, dir, linkRoots, fileid.Handle{})
+}
+
+func adoptModelFolder(root, dir string, linkRoots []string, expectedRoot fileid.Handle) (bool, error) {
 	if !filepath.IsAbs(root) || !filepath.IsAbs(dir) {
 		return false, errors.New("the models root and the folder must be absolute paths")
 	}
-	root, dir = filepath.Clean(root), filepath.Clean(dir)
-	// dir must exist directly under root, by file identity.
-	if parent, err := identity.SameFile(filepath.Dir(dir), root); err != nil || !parent {
+	// Resolve the caller's spelling before any lexical cleanup. The entry's
+	// parent is the physical walk of the spelling before its final separator.
+	if fileid.OlderPath(root) != nil || fileid.OlderPath(dir) != nil {
 		return false, nil
 	}
-	if same, err := identity.SameFile(dir, root); err != nil || same {
+	r, err := fileid.Open(context.Background(), fileid.Self, root, fileid.Options{})
+	if err != nil {
 		return false, nil
 	}
-	if err := privatedir.CheckModelsRoot(root); err != nil {
-		return false, err
+	defer r.Close()
+	if !expectedRoot.FileID().IsZero() && !r.FileID().Equal(expectedRoot.FileID()) {
+		return false, fmt.Errorf("%w: models root changed", privatedir.ErrNotModelFolder)
 	}
-	if err := privatedir.ProtectModelFolder(dir, append([]string{root}, linkRoots...)); err != nil {
+	leaf, err := fileid.ResolveLeaf(context.Background(), fileid.Self, dir)
+	if err != nil || !leaf.Folder().Equal(r.FileID()) {
+		return false, nil
+	}
+	d, err := fileid.Open(context.Background(), fileid.Self, dir, fileid.Options{})
+	if err != nil {
+		return false, nil
+	}
+	defer d.Close()
+	if d.FileID().Equal(r.FileID()) {
+		return false, nil
+	}
+	if !fileid.SamePathName(r.FileID().Path(), filepath.Clean(root)) {
+		return false, fmt.Errorf("%w: root does not name its final folder", privatedir.ErrNotModelFolder)
+	}
+	// Protection still owns the no-links policy and ACL transaction. Refuse
+	// nonlocal paths before its path-based metadata queries.
+	for _, p := range append([]string{root, dir}, linkRoots...) {
+		if err := nativeModelPath(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("%w: %v", privatedir.ErrNotModelFolder, err)
+		}
+	}
+	roots := []fileid.Handle{r}
+	defer func() {
+		for _, h := range roots[1:] {
+			h.Close()
+		}
+	}()
+	for _, p := range linkRoots {
+		h, err := fileid.Open(context.Background(), fileid.Self, p, fileid.Options{Links: fileid.RefuseLinks})
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("%w: %v", privatedir.ErrNotModelFolder, err)
+		}
+		roots = append(roots, h)
+	}
+	if err := privatedir.ProtectModelFolderAt(d, roots); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -389,17 +442,70 @@ func AdoptModelFolder(root, dir string, linkRoots []string) (bool, error) {
 // SetFolderOf is the folder directly under root that holds p, or "" when p
 // does not lie below root.
 func SetFolderOf(root, p string) string {
-	if p == "" {
+	if p == "" || fileid.OlderPath(root) != nil || fileid.OlderPath(p) != nil {
 		return ""
 	}
-	root = filepath.Clean(root)
-	// Containment by file identity (identity.WithinRel).
-	rel, inside, err := identity.WithinRel(p, root)
-	if err != nil || !inside {
+	r, err := fileid.Open(context.Background(), fileid.Self, root, fileid.Options{})
+	if err != nil {
 		return ""
 	}
-	first, _, _ := strings.Cut(rel, string(filepath.Separator))
-	return filepath.Join(root, first)
+	defer r.Close()
+	leaf, err := fileid.ResolveLeaf(context.Background(), fileid.Self, p)
+	if err == nil {
+		return modelSetBelow(r, leaf.Folder().Path(), []string{leaf.Name()})
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	// Pending supplies the physical spelling of an absent suffix under its
+	// stable anchor. Only absence permits this fallback; link/locality errors
+	// never become a textual containment answer.
+	pending, err := fileid.Pending(context.Background(), fileid.Self, p)
+	if err != nil {
+		return ""
+	}
+	return modelSetBelow(r, pending.Path(), nil)
+}
+
+// modelSetBelow relates the deepest existing folder to the held root. Text
+// below that identity is only the suffix Pending or ResolveLeaf supplied.
+func modelSetBelow(root fileid.Handle, p string, rest []string) string {
+	for {
+		h, err := fileid.Open(context.Background(), fileid.Self, p, fileid.Options{})
+		if err == nil {
+			defer h.Close()
+			relation, err := h.Relate(root)
+			if err != nil || !h.FileID().IsDir() || relation.Kind == fileid.RelationOutside {
+				return ""
+			}
+			rel := filepath.Join(append([]string{relation.Rel}, rest...)...)
+			if rel == "." || rel == "" {
+				return ""
+			}
+			first, _, _ := strings.Cut(rel, string(filepath.Separator))
+			return filepath.Join(root.FileID().Path(), first)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return ""
+		}
+		parent, name := filepath.Dir(p), filepath.Base(p)
+		if parent == p {
+			return ""
+		}
+		rest = append([]string{name}, rest...)
+		p = parent
+	}
+}
+
+func nativeModelPath(p string) error {
+	if err := fileid.OlderPath(p); err != nil {
+		return err
+	}
+	h, err := fileid.Open(context.Background(), fileid.Self, p, fileid.Options{Links: fileid.RefuseLinks})
+	if err != nil {
+		return err
+	}
+	return h.Close()
 }
 
 // SetFolders adds to into each folder directly under root that a recorded set
@@ -407,11 +513,24 @@ func SetFolderOf(root, p string) string {
 // places record names. A set with no record adds its named folder alone
 // (KIT-M3).
 func SetFolders(root, set string, places string, files []File, remedy string, add func(dir string)) error {
-	add(filepath.Join(root, set))
+	if err := nativeModelPath(root); err != nil {
+		return err
+	}
+	dir := SetFolderOf(root, root+string(filepath.Separator)+set)
+	if dir == "" {
+		return fmt.Errorf("%w: set folder is outside the models root", privatedir.ErrNotModelFolder)
+	}
+	add(dir)
 	if places == "" {
 		return nil
 	}
-	where, _, err := Read(places, set, files, remedy)
+	h, err := fileid.Open(context.Background(), fileid.Self, places, fileid.Options{Read: true})
+	var data []byte
+	if err == nil {
+		defer h.Close()
+		data, err = io.ReadAll(h.File())
+	}
+	where, _, err := readPlaces(places, set, files, remedy, data, err)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
